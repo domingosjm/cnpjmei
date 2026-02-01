@@ -106,77 +106,180 @@ async function findNameByLabel(page) {
 
 async function getAvailableYears(page) {
   const YEAR_SELECTOR = 'select[id*="ano"]';
+  let allOpts = [];
   if (await page.$(YEAR_SELECTOR)) {
-    const opts = await page.$$eval(`${YEAR_SELECTOR} option`, options =>
+    allOpts = await page.$$eval(`${YEAR_SELECTOR} option`, options =>
       options.map(o => ({ value: o.value, text: o.innerText.trim(), disabled: o.disabled || o.classList.contains('disabled') }))
     );
-    return opts.filter(o => o.text && !/não optante/i.test(o.text) && !o.disabled);
+  } else {
+    // Try to open dropdown if it's a custom select
+    const toggle = await page.$('[class*="filter-option"], .dropdown-toggle, [class*="selectpicker"]');
+    if (toggle) {
+      try { await toggle.click(); await sleep(400); } catch (e) {}
+    }
+    const els = await page.$$('a, button, span, div, li, option');
+    for (const el of els) {
+      try {
+        const txt = (await el.innerText()).trim();
+        const isDisabled = await el.getAttribute('aria-disabled') === 'true' || (await el.getAttribute('disabled')) !== null || (await el.getAttribute('class') || '').includes('disabled');
+        // Procura por anos (4 dígitos) ou texto com "não optante"
+        if (/^\d{4}$/.test(txt) || /não optante/i.test(txt)) {
+          const yearMatch = txt.match(/(\d{4})/);
+          const year = yearMatch ? yearMatch[1] : txt;
+          const isNotOptante = /não optante/i.test(txt) || isDisabled;
+          allOpts.push({ value: year, text: txt, disabled: isNotOptante, handle: el });
+        }
+      } catch (e) {}
+    }
+    // Close dropdown if opened
+    if (toggle) {
+      try { await toggle.click(); } catch (e) {}
+    }
   }
-  const els = await page.$$('a, button, span, div');
-  const years = [];
-  for (const el of els) {
-    try {
-      const txt = (await el.innerText()).trim();
-      const isDisabled = await el.getAttribute('aria-disabled') === 'true' || (await el.getAttribute('disabled')) !== null || (await el.getAttribute('class') || '').includes('disabled');
-      if (/^\d{4}$/.test(txt) && !/não optante/i.test(txt) && !isDisabled) years.push({ value: txt, text: txt, handle: el });
-    } catch (e) {}
-  }
-  return years;
+  
+  // Separar disponíveis dos não optantes com base no status disabled
+  const available = allOpts.filter(o => o.text && !o.disabled && /^\d{4}$/.test(o.value || o.text));
+  const notOptante = allOpts.filter(o => o.disabled || /não optante/i.test(o.text));
+  
+  return { available, notOptante, all: allOpts };
 }
 
 function normalizeHeader(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
 
 async function extractDebits(page, year) {
-  // Fast extraction: run inside page context to minimize round-trips
+  // Enhanced extraction with more comprehensive data capture
   return await page.evaluate((year) => {
     const currencyRegex = /R\$\s*[\d\.]+,\d{2}|[\d\.]+,\d{2}/g;
     const expectedHeaders = [
-      'período de apuração', 'apurado', 'benefício inss', 'resumo do das a ser gerado',
-      'principal', 'multa', 'juros', 'total', 'data de vencimento', 'data de acolhimento'
+      'período de apuração', 'periodo de apuracao', 'periodo', 'mes', 'mês',
+      'apurado', 'valor apurado', 'benefício inss', 'beneficio inss', 'inss',
+      'resumo do das a ser gerado', 'das', 'guia',
+      'principal', 'valor principal', 'multa', 'juros', 'total', 'valor total',
+      'data de vencimento', 'vencimento', 'data vencimento',
+      'data de acolhimento', 'acolhimento', 'data acolhimento',
+      'situação', 'situacao', 'status', 'pago', 'pendente'
     ];
     function normalizeHeader(s) { return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
     const out = [];
-    const tables = Array.from(document.querySelectorAll('table'));
-    for (const table of tables) {
+    
+    // Search all possible table containers
+    const containers = Array.from(document.querySelectorAll('table, div[class*="table"], .datatable, .grid, .list'));
+    
+    for (const container of containers) {
       try {
-        const txt = table.innerText || '';
-        if (!currencyRegex.test(txt)) continue;
-        const ths = Array.from(table.querySelectorAll('th'));
-        let headers = [];
-        if (ths.length) headers = ths.map(h => normalizeHeader(h.innerText || ''));
-        else {
-          const first = table.querySelector('tr');
-          if (first) headers = Array.from(first.querySelectorAll('td,th')).map(h => normalizeHeader(h.innerText || ''));
-        }
-        const hasExpected = headers.some(h => expectedHeaders.includes(h));
-        const rows = Array.from(table.querySelectorAll('tr'));
-        if (hasExpected && headers.length) {
-          const mapKeys = headers.map(h => { const idx = expectedHeaders.indexOf(h); return idx >= 0 ? expectedHeaders[idx] : h; });
-          for (let i = 1; i < rows.length; i++) {
-            try {
-              const cells = Array.from(rows[i].querySelectorAll('td,th'));
-              const rowObj = {};
-              for (let k = 0; k < mapKeys.length; k++) rowObj[mapKeys[k] || `col_${k}`] = (cells[k] && (cells[k].innerText || '').trim()) || null;
-              out.push(rowObj);
-            } catch (e) {}
+        const containerText = container.innerText || '';
+        
+        // Skip if no currency values or year references
+        if (!currencyRegex.test(containerText) && !containerText.includes(String(year))) continue;
+        
+        // Try to find table structure
+        const tables = container.tagName === 'TABLE' ? [container] : Array.from(container.querySelectorAll('table'));
+        
+        if (tables.length === 0) {
+          // Handle non-table structured data
+          const rows = Array.from(container.querySelectorAll('div[class*="row"], tr, li'));
+          for (const row of rows) {
+            const rowText = (row.innerText || '').trim();
+            if (rowText && (rowText.includes(String(year)) || currencyRegex.test(rowText))) {
+              const parts = rowText.split(/\t+|\s{3,}|\|/).map(s => s.trim()).filter(Boolean);
+              const currencies = rowText.match(currencyRegex) || [];
+              out.push({
+                raw: rowText,
+                parts: parts,
+                currencies: currencies,
+                year: year,
+                source: 'non-table'
+              });
+            }
           }
-        } else {
-          for (const r of rows) {
-            try {
-              const rowText = (r.innerText || '').trim();
-              if (!rowText) continue;
-              if (rowText.includes(String(year)) || currencyRegex.test(rowText)) {
-                const parts = rowText.split(/\t+|\s{2,}/).map(s => s.trim()).filter(Boolean);
-                const amountPart = parts.slice().reverse().find(p => /\d+[\.,]\d{2}/.test(p));
-                const amount = amountPart ? amountPart.replace(/[R\$\s\.]/g, '').replace(',', '.') : null;
-                out.push({ raw: rowText, parts, amount: amount ? Number(amount) : null });
+          continue;
+        }
+        
+        // Process actual tables
+        for (const table of tables) {
+          try {
+            const tableText = table.innerText || '';
+            if (!currencyRegex.test(tableText) && !tableText.includes(String(year))) continue;
+            
+            const rows = Array.from(table.querySelectorAll('tr'));
+            if (rows.length === 0) continue;
+            
+            // Extract headers from first few rows
+            let headers = [];
+            let headerRowIndex = -1;
+            
+            for (let i = 0; i < Math.min(3, rows.length); i++) {
+              const cells = Array.from(rows[i].querySelectorAll('td, th'));
+              const potentialHeaders = cells.map(cell => normalizeHeader(cell.innerText || ''));
+              
+              if (potentialHeaders.some(h => expectedHeaders.includes(h))) {
+                headers = potentialHeaders;
+                headerRowIndex = i;
+                break;
               }
-            } catch (e) {}
+            }
+            
+            // If no clear headers found, use first row or create generic headers
+            if (headers.length === 0 && rows.length > 0) {
+              const firstRowCells = Array.from(rows[0].querySelectorAll('td, th'));
+              if (firstRowCells.length > 0) {
+                headers = firstRowCells.map((_, idx) => `col_${idx}`);
+                headerRowIndex = -1; // Don't skip first row
+              }
+            }
+            
+            // Process data rows
+            const startRow = headerRowIndex >= 0 ? headerRowIndex + 1 : 0;
+            
+            for (let i = startRow; i < rows.length; i++) {
+              try {
+                const row = rows[i];
+                const cells = Array.from(row.querySelectorAll('td, th'));
+                const rowText = row.innerText || '';
+                
+                // Skip empty rows
+                if (!rowText.trim()) continue;
+                
+                // Include row if it has currency or year reference
+                if (currencyRegex.test(rowText) || rowText.includes(String(year)) || 
+                    cells.some(cell => currencyRegex.test(cell.innerText || ''))) {
+                  
+                  const rowObj = { year: year, source: 'table' };
+                  
+                  // Map cells to headers
+                  for (let k = 0; k < Math.max(cells.length, headers.length); k++) {
+                    const cellValue = (cells[k] && cells[k].innerText || '').trim();
+                    const headerKey = headers[k] || `col_${k}`;
+                    
+                    // Map to expected header if found
+                    const mappedKey = expectedHeaders.find(expected => 
+                      headerKey === expected || headerKey.includes(expected.split(' ')[0])
+                    ) || headerKey;
+                    
+                    rowObj[mappedKey] = cellValue || null;
+                  }
+                  
+                  // Extract all currency values
+                  const currencies = rowText.match(currencyRegex) || [];
+                  rowObj.currencies = currencies;
+                  rowObj.raw = rowText;
+                  
+                  out.push(rowObj);
+                }
+              } catch (e) {
+                console.warn('Error processing row:', e);
+              }
+            }
+          } catch (e) {
+            console.warn('Error processing table:', e);
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('Error processing container:', e);
+      }
     }
-    return out;
+    
+    return out.length > 0 ? out : [];
   }, year);
 }
 
@@ -199,7 +302,7 @@ async function safeExtractDebits(page, year, tries = 2) {
   if ('no-headless' in argvC || 'noheadless' in argvC) headless = false;
  //
   const digits = normalizeCNPJ(CNPJ);
-  const browser = await chromium.connectOverCDP('ws://localhost:9222/devtools/browser/afbfb788-a976-4fbc-9d29-b8e83c1662ee');
+  const browser = await chromium.connectOverCDP('ws://localhost:9222/devtools/browser/a26eda10-ba61-40e3-90c3-c21e2ddf6f59');
   const context = browser.contexts()[0];
   const pages = context.pages();
   const page = await context.newPage();
@@ -245,11 +348,17 @@ console.log('Navigating to page...');
   const MENU_TEXT = 'Emitir Guia de Pagamento (DAS)';
   console.log('Evaristo');
   try {
+    await page.waitForSelector(`text="${MENU_TEXT}"`, { timeout: 10000 });
     const menu = await page.$(`text="${MENU_TEXT}"`);
-    if (menu) { try { await menu.click(); await page.waitForLoadState('networkidle', { timeout: 5000 }); } catch (e) {} }
+    if (menu) { 
+      try { 
+        await menu.click(); 
+        await page.waitForLoadState('networkidle', { timeout: 5000 }); 
+      } catch (e) {} 
+    }
   } catch (e) {}
  console.log('Evaristo 2');
-  const years = await getAvailableYears(page);
+  const { available: years, notOptante, all: allYears } = await getAvailableYears(page);
  console.log('Evaristo 3')
   // Função para processar scraping de todos os anos na mesma página
   async function scrapeAllYearsSequential(page, digits, companyName, years) {
@@ -262,8 +371,8 @@ console.log('Navigating to page...');
         const menu = await page.$(`text="${MENU_TEXT}"`);
         if (menu) {
           await menu.click();
-          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-          await sleep(50);
+          await page.waitForLoadState('networkidle', { timeout: 20 }).catch(() => {});
+          await sleep(10);
         }
       } catch (e) {}
       // Selecionar ano
@@ -321,11 +430,25 @@ console.log('Evaristo 4')
   let resultJson;
   if (years && years.length) {
     all = await scrapeAllYearsSequential(page, digits, companyName, years);
-    resultJson = { cnpj: digits, companyName: companyName || null, years: all };
+    resultJson = { 
+      cnpj: digits, 
+      companyName: companyName || null, 
+      availableYears: years.map(y => y.text || y.value),
+      notOptanteYears: notOptante.map(y => y.text || y.value),
+      allYears: allYears.map(y => y.text || y.value),
+      years: all 
+    };
     try { fs.writeFileSync('debitos_all.json', JSON.stringify(resultJson, null, 2), 'utf8'); } catch (e) {}
   } else {
     const found = await safeExtractDebits(page, (argvC.year||argvC.y||new Date().getFullYear()), 3);
-    resultJson = { cnpj: digits, companyName: companyName || null, years: found };
+    resultJson = { 
+      cnpj: digits, 
+      companyName: companyName || null, 
+      availableYears: years.map(y => y.text || y.value),
+      notOptanteYears: notOptante.map(y => y.text || y.value),
+      allYears: allYears.map(y => y.text || y.value),
+      years: found 
+    };
     try { fs.writeFileSync('debitos_all.json', JSON.stringify(resultJson, null, 2), 'utf8'); } catch (e) {}
   }
 
@@ -348,7 +471,7 @@ console.log('Evaristo 4')
 
   // Exibir o JSON final no terminal
   console.log('\n===== RESULTADO EXTRAÇÃO =====\n');
-  console.log(JSON.stringify(resultJson, null, 2));
+  // console.log(JSON.stringify(resultJson, null, 2)); // Removido para evitar duplicação no endpoint
   console.log('\n=============================');
 
   // Fechar o navegador após exibir o resultado
