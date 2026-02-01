@@ -302,7 +302,7 @@ async function safeExtractDebits(page, year, tries = 2) {
   if ('no-headless' in argvC || 'noheadless' in argvC) headless = false;
  //
   const digits = normalizeCNPJ(CNPJ);
-  const browser = await chromium.connectOverCDP('ws://localhost:9222/devtools/browser/a26eda10-ba61-40e3-90c3-c21e2ddf6f59');
+  const browser = await chromium.connectOverCDP('http://31.97.95.251:9222/devtools/browser/0ba5b9df-a6ec-4f4c-83e6-88e64e976323');
   const context = browser.contexts()[0];
   const pages = context.pages();
   const page = await context.newPage();
@@ -479,5 +479,6 @@ console.log('Evaristo 4')
 
   console.log('Consulta finalizada');
 })();
+
 
 
